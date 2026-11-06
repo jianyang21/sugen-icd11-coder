@@ -158,6 +158,62 @@ def test_grouped_candidates_put_siblings_together():
     assert any(l.startswith("- 1F40 |") and "has children" in l for l in lines)
 
 
+class _Scripted(llm_coder._ChainClient):
+    """Chain client whose API is a script of errors keyed by model / sent params."""
+    OPTIONAL = ("temperature", "reasoning_effort", "max_tokens", "max_completion_tokens")
+
+    def __init__(self, models, missing=(), reject=None):
+        super().__init__(models, llm_coder.Spend(5.0))
+        self.missing, self.reject, self.max_param, self.sent = set(missing), reject or {}, "max_tokens", []
+
+    def repair_param(self, p):
+        llm_coder.OpenAICompatClient.repair_param(self, p)
+
+    def _once(self, model, system, user, schema, name, max_tokens):
+        params = {self.max_param, *(p for p in ("temperature", "reasoning_effort") if p not in self.dropped)}
+        self.sent.append((model, sorted(params)))
+        if model in self.missing:
+            raise HTTPError(404)
+        for p, msg in self.reject.items():
+            if p in params:
+                e = HTTPError(400)
+                e.args = (msg,)
+                raise e
+        return "{}"
+
+
+def test_model_chain_skips_unknown_model():
+    c = _Scripted(["gpt-bogus", "gpt-6-luna"], missing={"gpt-bogus"})
+    assert c.call("s", "u", {}, "n", 10) == "{}"
+    assert c.model == "gpt-6-luna"
+    c.call("s", "u", {}, "n", 10)  # later calls go straight to the working model
+    assert [m for m, _ in c.sent] == ["gpt-bogus", "gpt-6-luna", "gpt-6-luna"]
+
+
+def test_model_chain_exhausted_raises():
+    c = _Scripted(["a", "b"], missing={"a", "b"})
+    with pytest.raises(HTTPError):
+        c.call("s", "u", {}, "n", 10)
+
+
+def test_param_repair_swaps_max_tokens_and_drops_temperature():
+    c = _Scripted(["m"], reject={
+        "max_tokens": "Error code: 400 - Unsupported parameter: 'max_tokens' is not supported with this model. "
+                      "Use 'max_completion_tokens' instead.",
+        "temperature": "Error code: 400 - Unsupported value: 'temperature' does not support 0.2 with this model.",
+    })
+    assert c.call("s", "u", {}, "n", 10) == "{}"
+    assert c.max_param == "max_completion_tokens" and "temperature" in c.dropped
+    assert "reasoning_effort" not in c.dropped  # only what the API named is changed
+
+
+def test_unrelated_400_is_not_retried():
+    c = _Scripted(["m"], reject={"reasoning_effort": "Error code: 400 - prompt too long"})
+    with pytest.raises(HTTPError):
+        c.call("s", "u", {}, "n", 10)
+    assert len(c.sent) == 1
+
+
 def test_fake_extraction_fixture_matches_schema():
     from prompts import EXTRACT_SCHEMA
     assert not check_schema(_extraction(), EXTRACT_SCHEMA)

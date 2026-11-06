@@ -25,6 +25,7 @@ CODER_PRICE_IN / CODER_PRICE_OUT (USD per 1M tokens, overrides the table below).
 import copy
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -35,19 +36,28 @@ from prompts import (
 )
 from validate import clean_extraction, clean_selection, evidence_in_note, norm_code, selection_evidence
 
-DEFAULT_MODEL = {
-    # Chosen for the ~1 cent/note budget; override with CODER_MODEL.
-    "anthropic": "claude-haiku-5-5",
-    "openai": "gpt-5-mini",  # UNVERIFIED id: confirm before submitting
-    "sarvam": "sarvam-105b",
+# Model chains: if a model id is rejected as unknown, the client moves to the next one,
+# so one wrong or retired id costs a single failed call instead of the whole LLM path.
+# Chosen for the ~1 cent/note budget; CODER_MODEL (comma-separated) overrides.
+DEFAULT_MODELS = {
+    "anthropic": ["claude-haiku-5-5", "claude-haiku-4-5"],
+    # OpenAI pricing/models pages (read 2026-11-06): gpt-6-luna is the "most efficient
+    # model for focused, high-volume tasks"; older cheap ids still priced as backups.
+    "openai": ["gpt-6-luna", "gpt-5.6-luna", "gpt-5-mini", "gpt-4o-mini"],
+    "sarvam": ["sarvam-105b"],
 }
 
 # USD per 1M tokens: (input, output, cache read). Unknown models use a pessimistic default
 # so the budget guard errs towards stopping early.
 PRICES = {
     "claude-haiku-5-5": (0.10, 0.50, 0.01),
+    "claude-haiku-4-5": (1.00, 5.00, 0.10),
     "claude-sonnet-5-5": (2.00, 10.00, 0.20),
     "claude-opus-5-5": (4.00, 20.00, 0.20),
+    "gpt-6-luna": (0.10, 0.50, 0.01),
+    "gpt-5.6-luna": (0.20, 1.20, 0.02),
+    "gpt-5-mini": (0.25, 2.00, 0.025),
+    "gpt-4o-mini": (0.15, 0.60, 0.075),
     "sarvam-105b": (0.18, 0.71, 0.06),  # INR 15/60/5 per 1M at ~85 INR/USD
 }
 UNKNOWN_PRICE = (3.00, 15.00, 0.30)
@@ -93,25 +103,28 @@ class LLMDisabled(RuntimeError):
     pass
 
 
+def price_of(model: str) -> tuple[float, float, float]:
+    p = PRICES.get(model, UNKNOWN_PRICE)
+    if os.environ.get("CODER_PRICE_IN"):
+        p = (float(os.environ["CODER_PRICE_IN"]), float(os.environ.get("CODER_PRICE_OUT", p[1])), p[2])
+    return p
+
+
 class Spend:
-    def __init__(self, model: str, budget: float):
-        p = PRICES.get(model, UNKNOWN_PRICE)
-        if os.environ.get("CODER_PRICE_IN"):
-            p = (float(os.environ["CODER_PRICE_IN"]), float(os.environ.get("CODER_PRICE_OUT", p[1])), p[2])
-        self.p_in, self.p_out, self.p_cache = p
+    def __init__(self, budget: float):
         self.budget = budget
         self.usd = 0.0
         self.calls = 0
         self.tok_in = self.tok_out = 0
         self.lock = threading.Lock()
 
-    def add(self, tin: int, tout: int, cache_read: int = 0, cache_write: int = 0):
+    def add(self, model: str, tin: int, tout: int, cache_read: int = 0, cache_write: int = 0):
+        p_in, p_out, p_cache = price_of(model)  # per model: the chain may switch models mid-run
         with self.lock:
             self.calls += 1
             self.tok_in += tin + cache_read + cache_write
             self.tok_out += tout
-            self.usd += (tin * self.p_in + cache_write * self.p_in * 1.25
-                         + cache_read * self.p_cache + tout * self.p_out) / 1e6
+            self.usd += (tin * p_in + cache_write * p_in * 1.25 + cache_read * p_cache + tout * p_out) / 1e6
 
     def check(self):
         if self.usd >= self.budget:
@@ -122,21 +135,99 @@ class Spend:
 # Provider clients: call(system, user, schema, name, max_tokens) -> text
 # --------------------------------------------------------------------------- #
 
-class AnthropicClient:
-    def __init__(self, model: str, spend: Spend, timeout: float, effort: str | None):
+_QUOTED = re.compile(r"['\"`]([a-z_][a-z0-9_.]*)['\"`]")
+_MODEL_MISSING = ("not found", "does not exist", "unknown model", "invalid model", "no such model",
+                  "model_not_found", "not available", "do not have access")
+
+
+class _ChainClient:
+    """Shared retry logic for provider clients.
+
+    - Model chain: a request rejected because the model id is unknown or unavailable
+      moves the whole client to the next model in the list (thread-safe, logged).
+    - Parameter repair: a 400 naming one of our optional parameters (e.g. a model that
+      rejects 'temperature' or wants 'max_completion_tokens' instead of 'max_tokens')
+      drops or swaps that parameter for all later calls and retries once.
+    Both are bounded per call, then the error is raised to the coder (breaker/fallback).
+    """
+    OPTIONAL: tuple = ()
+
+    def __init__(self, models: list[str], spend: "Spend"):
+        self.models = list(models)
+        self.i = 0
+        self.spend = spend
+        self.dropped: set[str] = set()
+        self.lock = threading.Lock()
+
+    @property
+    def model(self) -> str:
+        return self.models[self.i]
+
+    def status(self, e: Exception) -> int | None:
+        return getattr(e, "status_code", None)
+
+    def _bad_param(self, msg: str) -> str | None:
+        for tok in _QUOTED.findall(msg):  # first quoted name is usually the offending one
+            if tok in self.OPTIONAL and tok not in self.dropped:
+                return tok
+        for p in self.OPTIONAL:
+            if p in msg and p not in self.dropped:
+                return p
+        return None
+
+    def repair_param(self, p: str) -> None:
+        self.dropped.add(p)
+
+    def call(self, system, user, schema, name, max_tokens) -> str:
+        for _ in range(len(self.models) + 4):
+            model = self.model
+            try:
+                return self._once(model, system, user, schema, name, max_tokens)
+            except Exception as e:
+                st = self.status(e)
+                msg = str(e).lower()
+                if st == 404 or (st in (400, 403) and "model" in msg and any(k in msg for k in _MODEL_MISSING)):
+                    with self.lock:
+                        if self.model == model and self.i + 1 < len(self.models):
+                            self.i += 1
+                            _log(f"model {model!r} rejected (HTTP {st}); switching to {self.model!r}")
+                            continue
+                    if self.model != model:
+                        continue  # another thread already switched
+                    raise
+                if st == 400:
+                    p = self._bad_param(msg)
+                    if p:
+                        with self.lock:
+                            if p not in self.dropped:
+                                self.repair_param(p)
+                                _log(f"{model}: parameter {p!r} rejected; dropping it for later calls")
+                        continue
+                raise
+        raise RuntimeError("model chain / parameter repair exhausted")
+
+
+class AnthropicClient(_ChainClient):
+    OPTIONAL = ("effort",)
+
+    def __init__(self, models: list[str], spend: Spend, timeout: float, effort: str | None):
         import anthropic
+        super().__init__(models, spend)
         self.anthropic = anthropic
         # 429s were the main failure in Sarvam replays (up to 36/235 select calls);
         # the SDK backs off exponentially and honours retry-after.
         self.client = anthropic.Anthropic(timeout=timeout, max_retries=int(os.environ.get("CODER_MAX_RETRIES", "5")))
-        self.model, self.spend, self.effort = model, spend, effort
+        self.effort = effort
 
-    def call(self, system: str, user: str, schema: dict, name: str, max_tokens: int) -> str:
+    def status(self, e: Exception) -> int | None:
+        return getattr(e, "status_code", None) if isinstance(e, self.anthropic.APIStatusError) else None
+
+    def _once(self, model, system, user, schema, name, max_tokens) -> str:
         output_config = {"format": {"type": "json_schema", "schema": api_schema(schema)}}
-        if self.effort:
+        if self.effort and "effort" not in self.dropped:
             output_config["effort"] = self.effort
         r = self.client.messages.create(
-            model=self.model,
+            model=model,
             max_tokens=max_tokens,
             # static system prompt -> cacheable prefix across all notes
             system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
@@ -144,7 +235,7 @@ class AnthropicClient:
             output_config=output_config,
         )
         u = r.usage
-        self.spend.add(u.input_tokens or 0, u.output_tokens or 0,
+        self.spend.add(model, u.input_tokens or 0, u.output_tokens or 0,
                        getattr(u, "cache_read_input_tokens", 0) or 0,
                        getattr(u, "cache_creation_input_tokens", 0) or 0)
         if r.stop_reason == "refusal":
@@ -153,16 +244,21 @@ class AnthropicClient:
             raise RuntimeError("hit max_tokens")
         return next((b.text for b in r.content if b.type == "text"), "")
 
-    def status(self, e: Exception) -> int | None:
-        return getattr(e, "status_code", None) if isinstance(e, self.anthropic.APIStatusError) else None
 
+class OpenAICompatClient(_ChainClient):
+    """OpenAI, or any OpenAI-compatible endpoint (Sarvam) via base_url.
 
-class OpenAICompatClient:
-    """OpenAI, or any OpenAI-compatible endpoint (Sarvam) via base_url."""
+    max_param: "max_completion_tokens" for OpenAI (reasoning models reject max_tokens),
+    "max_tokens" for Sarvam (its documented name). A 400 naming either swaps to the other.
+    temperature: None means "don't send" (OpenAI reasoning models may reject it).
+    """
+    OPTIONAL = ("temperature", "reasoning_effort", "max_tokens", "max_completion_tokens")
 
-    def __init__(self, model: str, spend: Spend, timeout: float, effort: str | None,
-                 api_key: str | None = None, base_url: str | None = None):
+    def __init__(self, models: list[str], spend: Spend, timeout: float, effort: str | None,
+                 api_key: str | None = None, base_url: str | None = None,
+                 max_param: str = "max_completion_tokens", temperature: float | None = None):
         import openai
+        super().__init__(models, spend)
         self.openai = openai
         kw = {"timeout": timeout, "max_retries": int(os.environ.get("CODER_MAX_RETRIES", "5"))}
         if api_key:
@@ -170,20 +266,26 @@ class OpenAICompatClient:
         if base_url:
             kw["base_url"] = base_url
         self.client = openai.OpenAI(**kw)
-        self.model, self.spend, self.effort = model, spend, effort
+        self.effort, self.max_param, self.temperature = effort, max_param, temperature
 
-    def call(self, system: str, user: str, schema: dict, name: str, max_tokens: int) -> str:
-        kw = {}
-        if self.effort:
+    def status(self, e: Exception) -> int | None:
+        return getattr(e, "status_code", None) if isinstance(e, self.openai.APIStatusError) else None
+
+    def repair_param(self, p: str) -> None:
+        if p in ("max_tokens", "max_completion_tokens"):
+            if p == self.max_param:  # the token-limit name we use was rejected: use the other
+                self.max_param = "max_tokens" if p == "max_completion_tokens" else "max_completion_tokens"
+            return
+        self.dropped.add(p)
+
+    def _once(self, model, system, user, schema, name, max_tokens) -> str:
+        kw = {self.max_param: max_tokens}
+        if self.effort and "reasoning_effort" not in self.dropped:
             kw["reasoning_effort"] = self.effort
-        temp = os.environ.get("CODER_TEMPERATURE", "0.2")
-        if temp != "":
-            # Sarvam v2 defaults to temperature 1 (two identical dev runs: 65.8 vs 58.3).
-            # Temperature 0 made extraction loop until max_tokens (33 failures in 60 notes).
-            kw["temperature"] = float(temp)
+        if self.temperature is not None and "temperature" not in self.dropped:
+            kw["temperature"] = self.temperature
         r = self.client.chat.completions.create(
-            model=self.model,
-            max_tokens=max_tokens,
+            model=model,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             response_format={"type": "json_schema",
                              "json_schema": {"name": name, "schema": api_schema(schema), "strict": True}},
@@ -193,14 +295,11 @@ class OpenAICompatClient:
         if u:
             details = getattr(u, "prompt_tokens_details", None)
             cached = (getattr(details, "cached_tokens", 0) or 0) if details else 0
-            self.spend.add((u.prompt_tokens or 0) - cached, u.completion_tokens or 0, cached)
+            self.spend.add(model, (u.prompt_tokens or 0) - cached, u.completion_tokens or 0, cached)
         ch = r.choices[0]
         if ch.finish_reason == "length":
             raise RuntimeError("hit max_tokens")
         return ch.message.content or ""
-
-    def status(self, e: Exception) -> int | None:
-        return getattr(e, "status_code", None) if isinstance(e, self.openai.APIStatusError) else None
 
 
 _GENERIC = {"disease", "disorder", "acute", "chronic", "infection", "syndrome", "condition",
@@ -297,25 +396,32 @@ class Coder:
         provider = pick_provider()
         if provider is None:
             raise RuntimeError("no provider key")
-        model = os.environ.get("CODER_MODEL") or DEFAULT_MODEL.get(provider)
+        if provider not in DEFAULT_MODELS:
+            raise RuntimeError(f"unknown provider {provider!r}")
+        env_models = [m.strip() for m in os.environ.get("CODER_MODEL", "").split(",") if m.strip()]
+        models = env_models or DEFAULT_MODELS[provider]
         timeout = float(os.environ.get("CODER_TIMEOUT_S", "60"))
         # sarvam-105b reasons by default and reasoning tokens count against max_tokens:
         # at "low" it spent all 4000 tokens reasoning; "none" gave valid JSON in ~5 s.
         default_effort = {"sarvam": "none"}.get(provider, "low")
         effort = os.environ.get("CODER_EFFORT", default_effort) or None
-        self.spend = Spend(model, float(os.environ.get("CODER_BUDGET_USD", "5.0")))
+        temp_env = os.environ.get("CODER_TEMPERATURE")
+        self.spend = Spend(float(os.environ.get("CODER_BUDGET_USD", "5.0")))
         if provider == "anthropic":
-            self.client = AnthropicClient(model, self.spend, timeout, effort)
+            self.client = AnthropicClient(models, self.spend, timeout, effort)
         elif provider == "openai":
-            self.client = OpenAICompatClient(model, self.spend, timeout, effort)
-        elif provider == "sarvam":
+            # No temperature by default: OpenAI reasoning models may reject non-default values.
             self.client = OpenAICompatClient(
-                model, self.spend, timeout, effort,
+                models, self.spend, timeout, effort, max_param="max_completion_tokens",
+                temperature=float(temp_env) if temp_env else None)
+        else:  # sarvam
+            # Sarvam v2 defaults to temperature 1 (two identical dev runs: 65.8 vs 58.3);
+            # temperature 0 made extraction loop until max_tokens. 0.2 is its v1 default.
+            self.client = OpenAICompatClient(
+                models, self.spend, timeout, effort,
                 api_key=os.environ["SARVAM_API_KEY"],
                 base_url=os.environ.get("SARVAM_BASE_URL", "https://api.sarvam.ai/v2"),
-            )
-        else:
-            raise RuntimeError(f"unknown provider {provider!r}")
+                max_param="max_tokens", temperature=float(temp_env) if temp_env else 0.2)
         self.idx, self.valid = idx, valid
         self.n_short = int(os.environ.get("CODER_SHORTLIST_N", "40"))
         self.max_fatal = int(os.environ.get("CODER_MAX_FATAL", "5"))
@@ -332,9 +438,13 @@ class Coder:
         self.lock = threading.Lock()
         trace = os.environ.get("CODER_TRACE")
         self.trace = open(trace, "w", encoding="utf-8") if trace else None
-        self.provider, self.model = provider, model
-        _log(f"provider={provider} model={model} effort={effort} shortlist={self.n_short} "
+        self.provider = provider
+        _log(f"provider={provider} models={models} effort={effort} shortlist={self.n_short} "
              f"budget=${self.spend.budget:.2f}")
+
+    @property
+    def model(self) -> str:
+        return self.client.model
 
     # -- one API call with breaker + budget ----------------------------------
     def _call(self, system, user, schema, name, max_tokens) -> str:

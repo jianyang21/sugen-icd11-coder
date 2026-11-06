@@ -1,4 +1,7 @@
 # Runtime needs only the standard library for the no-LLM path.
-# The model SDKs are for the LLM path (step 4); both honour HTTPS_PROXY by default.
-anthropic>=0.40
-openai>=1.50
+# The model SDKs are for the LLM path; both honour HTTPS_PROXY by default.
+# Pinned to the versions the image was tested with (28/28 tests inside the image,
+# live run through the container). anthropic >= 2.x is required: older 0.x releases
+# have no `output_config` argument, which structured output depends on.
+anthropic==2.6.0
+openai==3.46.0
