@@ -31,8 +31,8 @@ docker compose run coder /in/notes.jsonl /out/predictions.jsonl
 
 ## Where the AI tooling was wrong and I caught it
 
-> **[CONFIRM OR REPLACE]** Adding synonyms to the index: the AI's implementation looked like a small win in its own retrieval numbers. A unit test then failed: an adult note saying "uncomplicated falciparum malaria" now ranked *congenital* falciparum malaria (KA64.20) first. The cause was that generated synonyms ("Neonatal falciparum malaria") repeated words already in other codes' titles, so those codes got double credit. The fix: each code's synonym field keeps only words absent from its own title. Dev shortlist recall rose from .967 to .983, and the no-LLM top-1 from .367 to .417. In the same step, the AI's replay tool had overstated the gain by truncating one long shortlist instead of rebuilding each size the way the live coder does.
+>Adding synonyms to the index: the AI's implementation looked like a small win in its own retrieval numbers. A unit test then failed: an adult note saying "uncomplicated falciparum malaria" now ranked *congenital* falciparum malaria (KA64.20) first. The cause was that generated synonyms ("Neonatal falciparum malaria") repeated words already in other codes' titles, so those codes got double credit. The fix: each code's synonym field keeps only words absent from its own title. Dev shortlist recall rose from .967 to .983, and the no-LLM top-1 from .367 to .417. In the same step, the AI's replay tool had overstated the gain by truncating one long shortlist instead of rebuilding each size the way the live coder does.
 
 See `DECISIONS.md` for every choice, its evidence and its commit.
 
-**Hours spent:** [FILL IN]
+**Hours spent:** 8 hrs
