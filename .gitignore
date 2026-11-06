@@ -1,0 +1,9 @@
+in/*
+!in/.gitkeep
+out/*
+!out/.gitkeep
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+._*
