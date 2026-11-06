@@ -1,0 +1,13 @@
+.git
+in/
+out/
+tests/
+tools/
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.env
+**/._*
+data/synth/
+public/data/dev_notes.jsonl
+public/data/predictions.example.jsonl

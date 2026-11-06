@@ -1,0 +1,4 @@
+# Runtime needs only the standard library for the no-LLM path.
+# The model SDKs are for the LLM path (step 4); both honour HTTPS_PROXY by default.
+anthropic>=0.40
+openai>=1.50

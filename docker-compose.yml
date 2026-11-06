@@ -1,0 +1,23 @@
+# Usage (from a clean clone):
+#   docker compose run coder /in/notes.jsonl /out/predictions.jsonl
+# ./in is mounted read-only at /in, ./out at /out.
+services:
+  coder:
+    build: .
+    image: sugen-icd11-coder
+    volumes:
+      - ./in:/in:ro
+      - ./out:/out
+    environment:
+      # Passed through from the host. Unset values stay unset, and the no-LLM path is used.
+      - ANTHROPIC_API_KEY
+      - OPENAI_API_KEY
+      - HTTPS_PROXY
+      - https_proxy
+      - HTTP_PROXY
+      - http_proxy
+      - NO_PROXY
+      - no_proxy
+      - CODER_DEADLINE_S
+      - CODER_WORKERS
+      - CODER_NO_LLM
